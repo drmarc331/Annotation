@@ -1,0 +1,157 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use PostData;
+use FileHandle;
+use MVS::Utils;
+use Getopt::Std;
+use vars qw($opt_i $opt_t $opt_a $opt_b $opt_r);
+use List::MoreUtils qw/uniq/;
+my $cmd = $0.' '.join(' ', @ARGV);
+getopts('i:t:a:b:r:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-i    <dbsnp.gvf directory>'."\n".
+    '-t    <generate | annotate>'."\n".
+    '-r    <SIFT report>'."\n".
+    '-a/-b <in.gvf/out.gvf>'."\n".
+    ''."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chr1 chr2 chr3 chr4 chr5 chr6 chr7
+	       chr8 chr9 chr10 chr11 chr12 chr13
+	       chr14 chr15 chr16 chr17 chr18 chr19
+	       chr20 chr21 chr22 chrX chrY chrMT);
+my %GVF;
+
+##---------------------Body----------------------##
+my @FILES = get_files($opt_i);
+my $OUT = get_outfile() if $opt_t eq 'generate';
+foreach(@CHROM){
+    my $chr = $_;
+    if($opt_t eq 'generate'){
+	print STDERR "Getting variants for $chr \n";
+	foreach(@FILES){
+	    get_locations($_, $chr);
+	}
+    }elsif($opt_t eq 'annotate'){
+	get_annotations($opt_r, $chr) if $opt_t eq 'annotate';
+	foreach(@FILES){
+            get_locations($_, $chr);
+        }
+    }
+    %GVF = ();
+}
+
+
+##------------------PostData---------------------##
+
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub add_pragmas{
+    my $line = shift;
+    my $file = shift;
+    return $line unless $line =~ /attribute-method/;
+    my $add = $cmd;
+    $add =~ s/$opt_i/$file/;
+    $line .= 'Annotation_SIFT='.$add.';';
+    return $line;
+}
+##-----------------------------------------------##
+sub get_annotations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($id, $coord, $codon, $transcript, $protein, $substitution, $region, $dbSNP, $type, $prediction, $SIFT_score,
+	    $median, $sequences, $comments) = split(/\t/, $line);
+	my ($chr, $start, $strand, $variant) = split(/\,/, $id);
+	next unless $filter eq 'chr'.$chr;
+	my $annotation = join(' ', $prediction, $SIFT_score, $sequences);
+	$GVF{$id} = $annotation;
+    }
+}
+##-----------------------------------------------##
+sub get_outfile{
+    my $file = 'sift_temp.txt';
+    my $fh = new FileHandle;
+    $fh -> open(">> $file");
+    return $fh;
+}
+##-----------------------------------------------##
+sub get_locations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    my $outfile = $file;
+    $outfile =~ s/$opt_a/$opt_b/;
+    my $out = new FileHandle;
+    $out -> open(">> $outfile");
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	next if $line =~ /\#/;
+	next if length($line) == 0;
+	my ($chr, $source, $type, $start, $stop, $quality, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $filter eq $chr;
+	$chr =~ s/chr//;
+	my ($ref, $var, $prediction);
+	my @split = split(/\;/, $info);
+	foreach(@split){
+	    $ref = $_ if $_ =~ /Reference_seq/;
+	    $var = $_ if $_ =~ /Variant_seq/;
+	    $prediction = $_ if $_ =~ /Variant_prediction/;
+	}
+	$ref =~ s/Reference_seq=//;
+	$var =~ s/Variant_seq=//;
+	$var =~ s/$ref,// if $info =~ /heterozygous/;
+	my $id = join(',', $chr, $start, 1, $ref.'/'.$var);
+	print $OUT $id."\n" if $opt_t eq 'generate';
+	next if $opt_t eq 'generate';
+	if(defined($GVF{$id})){
+	    my $annotation = $GVF{$id};
+	    if(defined($prediction)){
+		$annotation = $prediction.',SIFT:'.$annotation;
+		$line =~ s/$prediction/$annotation/;
+		print $out $line."\n";
+	    }else{
+		$annotation = 'Variant_prediction='.'SIFT:'.$annotation.';';
+		print $out $line.$annotation."\n";
+	    }
+	}else{
+	    print $out $line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_files{
+    my $dir = shift;
+    opendir(DIR, $dir);
+    my @files = readdir(DIR);
+    my @gvf;
+    foreach(@files){
+	push(@gvf, $dir.$_) if $_ =~ /$opt_a/;
+    }
+    return @gvf;
+}
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_t && $opt_a && $opt_b;
+    return 1;
+}

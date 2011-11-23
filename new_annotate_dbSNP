@@ -1,0 +1,228 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use PostData;
+use FileHandle;
+use MVS::Utils;
+use Getopt::Std;
+use List::MoreUtils qw/uniq/;
+use vars qw($opt_i $opt_a $opt_d $opt_b);
+my $cmd = $0.' '.join(' ', @ARGV);
+getopts('i:d:b:a:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-i    <gvf directory>'."\n".
+    '-d    <dbSNP prefix>'."\n".
+    '-a/-b <in.gvf/out.gvf>'."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chr1 chr2 chr3 chr4 chr5 chr6 chr7
+	       chr8 chr9 chr10 chr11 chr12 chr13
+	       chr14 chr15 chr16 chr17 chr18 chr19
+	       chr20 chr21 chr22 chrX chrY chrMT);
+
+my %GVF;
+my %DBSNP;
+my %METRICS;
+
+##---------------------Body----------------------##
+my @FILES = get_files($opt_i);
+foreach(@CHROM){
+    my $chr = $_;
+    #next unless $chr eq 'chr10';
+    print STDERR "Getting variants for $chr \n";
+    my $max = 0;
+    my $min = 1000000000000;
+    foreach(@FILES){
+	my ($high, $low) = get_locations($_, $chr);
+	$max = $high unless $max > $high;
+	$min = $low unless $min < $low;
+    }
+    next if $max == 0;
+    get_dbSNP($opt_d, $chr, $max, $min);
+    foreach(@FILES){
+	print STDERR "\t\tAnnotating $_\n";
+	print_annotations($_, $chr);
+    }
+    %GVF = ();
+    %DBSNP = ();
+}
+foreach(@FILES){
+    $_ =~ s/\.gvf/\.$opt_b\.gvf/ unless $opt_a;
+    $_ =~ s/$opt_a/$opt_b/ if $opt_a;
+    my $total_var = `cat $_ | grep -v '#' | wc -l`;
+    chomp $total_var;
+    my $annotated = `cat $_ | grep -v '#' | grep dbSNP | wc -l`;
+    chomp $annotated;
+    print STDERR "$_ Annotated $annotated of $total_var variants\n";
+}
+
+##------------------PostData---------------------##
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+sub add_pragmas{
+    my $line = shift;
+    my $file = shift;
+    return $line unless $line =~ /attribute-method/;
+    my $add = $cmd;
+    $add =~ s/$opt_i/$file/;
+    $line .= 'Annotation_dbSNP='.$add.';';
+    return $line;
+}
+##-----------------------------------------------##
+sub print_annotations{
+    my $file = shift;
+    my $filter = shift;
+    my $outfile = $file;
+    if($opt_a){
+	$outfile =~ s /$opt_a/$opt_b/;
+    }else{    
+	$outfile =~ s/\.gvf/\.$opt_b\.gvf/;
+    }   
+    my $in = new FileHandle;
+    my $out = new FileHandle;
+    $in -> open($file);
+    $out -> open(">> $outfile");
+    while(defined(my $line = <$in>)){
+	chomp $line;
+	if($line =~ /\#/){
+	    next unless $filter eq 'chr1';
+	    $line = add_pragmas($line, $file);
+	    print $out $line."\n";
+	    next;
+	}
+	next if length($line) == 0;
+        my ($chr, $source, $type, $start, $stop, $five, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $chr eq $filter;
+	if(defined $DBSNP{$start}){
+	    my $class = $DBSNP{$start}{class};
+	    my $id = $DBSNP{$start}{rs};
+	    if($class =~ /\;/ || $id =~ /\;/){
+		my @classes = split(/\;/, $class);
+		my @ids = split(/\;/, $id);
+		foreach(@classes){
+		    $_ =~ s/\S+\://;
+		}
+		foreach(@ids){
+		    $_ =~ s/\S+\://;
+		}
+		my @adds;
+		foreach(my $i = 0; $i < @ids; $i++){
+		    push(@adds, 'dbSNP:'.$ids[$i].'|'.$classes[$i]);
+		}
+		print $out $line.'Dbxref='.(join(',', uniq(@adds))).';'."\n";
+	    }else{
+		my $add = 'dbSNP:'.$id.'|'.$class.';';
+		print $out $line.'Dbxref='.$add."\n";
+	    }
+	}else{
+	    print $out $line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_dbSNP{
+    my $file = shift;
+    my $filter = shift;
+    my $max = shift;
+    my $min = shift;
+    print STDERR "\tGetting dbSNP for $filter\n";
+    $file .= $filter.'.gvf';
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($chr, $source, $type, $start, $stop, $five, $strand, $seven, $info) = split(/\t/, $line);
+	next if $start < $min;
+	next unless defined $GVF{$start};
+	last if $start > $max;
+	my $check = check_type($start, $type);
+	next unless $check > 0;
+	my @split = split(/\;/, $info);
+	my $id = shift(@split);
+	$id =~ s/ID=//;
+	my $class;
+	foreach(@split){
+	    $class = $_ if $_ =~ /Genotype/;
+	}
+	$class =~ s/Genotype=//;
+	if(defined($DBSNP{$start}) && $DBSNP{$start}{rs} ne $id ){
+	    $DBSNP{$start}{build} = $source;
+            $DBSNP{$start}{class} .= ';'.$type.':'.$class;
+            $DBSNP{$start}{rs} .= ';'.$type.':'.$id;
+	}else{
+	    $DBSNP{$start}{build} = $source;
+	    $DBSNP{$start}{class} = $class;
+	    $DBSNP{$start}{rs} = $id;
+	}
+    }
+}
+##-----------------------------------------------##
+sub check_type{
+    my $start = shift;
+    my $type = shift;
+    my $ref = $GVF{$start};
+    my $result = 0;
+    if($type eq 'SNV'){
+	$result++ if $ref =~ /SNV/;
+    }else{
+	$result++ if $ref =~ /NUCLEOTIDE/;
+    }
+    if($type eq'unknown' && $result == 0){
+	$result++;
+    }
+    return $result;
+}
+##-----------------------------------------------##
+sub get_locations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    my $max = 0;
+    my $min = 1000000000000;
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	next if $line =~ /\#/;
+	next if length($line) == 0;
+	my ($chr, $source, $type, $start, $stop, $quality, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $filter eq $chr;
+	$GVF{$start} .= $type.';';
+	$max = $start unless $max > $start;
+	$min = $start unless $min < $start;
+    }
+    return ($max, $min);;
+}
+##-----------------------------------------------##
+sub get_files{
+    my $dir = shift;
+    opendir(DIR, $dir);
+    my @files = readdir(DIR);
+    my @gvf;
+    foreach(@files){
+	if($opt_a){
+	    push(@gvf, $dir.$_) if $_ =~ /$opt_a\.gvf/;
+	}else{
+	    push(@gvf, $dir.$_) if $_ =~ /\.gvf/;
+	}
+    }
+    return @gvf;
+}
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_d && $opt_b;
+    return 1;
+}

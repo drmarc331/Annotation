@@ -1,0 +1,271 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use PostData;
+use Math::Round;
+use FileHandle;
+use MVS::Utils;
+use Getopt::Std;
+use vars qw($opt_i $opt_d $opt_a $opt_b);
+use List::MoreUtils qw/uniq/;
+my $cmd = $0.' '.join(' ', @ARGV);
+getopts('i:d:a:b:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-i   <annotated gvf directory>'."\n".
+    '-d   <gff3 directory>'."\n".
+    '-a/-b <in.gvf/out.gvf>'."\n".
+    ''."\n".
+    ''."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chr1 chr2 chr3 chr4 chr5 chr6 chr7
+	       chr8 chr9 chr10 chr11 chr12 chr13
+	       chr14 chr15 chr16 chr17 chr18 chr19
+	       chr20 chr21 chr22 chrX chrY chrMT);
+my %GVF;
+my %GENES;
+my %RESULTS;
+
+##---------------------Body----------------------##
+my @FILES = get_files($opt_i);
+foreach(@CHROM){
+    my $chr = $_;
+    print STDERR "Getting variants for $chr \n";
+    my $max = 0;
+    my $min = 1000000000000;
+    foreach(@FILES){
+	my ($high, $low) = get_locations($_, $chr);
+	$max = $high unless $max > $high;
+	$min = $low unless $min < $low;
+    }
+    next unless (keys %GVF) > 0;
+    get_genes($opt_d, $chr, $max, $min);
+    pull_rest($opt_d, $chr);
+    foreach(@FILES){
+	add_annotations($_, $chr);
+    }
+    #PostData(\%RESULTS);
+    %GVF = ();
+    %GENES = ();
+    %RESULTS = ();
+}
+
+
+##------------------PostData---------------------##
+
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub add_pragmas{
+    my $line = shift;
+    my $file = shift;
+    return $line unless $line =~ /attribute-method/;
+    my $add = $cmd;
+    $add =~ s/$opt_i/$file/;
+    $line .= 'Annotation_Features='.$add.';';
+    return $line;
+}
+##-----------------------------------------------##
+sub add_annotations{
+    my $infile = shift;
+    my $outfile = $infile;
+    $outfile =~ s/$opt_a/$opt_b/;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    my $out = new FileHandle;
+    $fh -> open($infile);
+    $out -> open(">> $outfile");
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	if($line =~ /\#/){
+	    next unless $filter eq 'chr1';
+	    $line = add_pragmas($line, $infile);
+	    print $out $line."\n";
+	    next;
+	}
+	next unless length($line) > 0;
+	my ($chr, $source, $type, $start, $stop, $qual, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $chr eq $filter;
+	if(defined $RESULTS{$start}){
+	    my @adding;
+	    my %SET = %{$RESULTS{$start}};
+	    foreach my $id (keys %SET){
+		my ($variant, $index, $feature, $feature_id);
+		$variant = 'sequence_variant';
+		$feature = 'intron';
+		$feature_id = $id;
+		$index = 0;
+		$index = 1 unless $info =~ /homozygous/;
+		if($SET{$id} =~ /splice_region_variant/){
+		    $variant = 'splice_region_variant';
+		}else{
+		    if($SET{$id} =~ /three_prime_UTR/){
+			$variant = '3_prime_UTR_variant';
+		    }elsif($SET{$id} =~ /five_prime_UTR/){
+			$variant = '5_prime_UTR_variant';
+		    }
+		}
+		if($SET{$id} =~ /CDS/){
+		    $feature = 'CDS';
+		}elsif($SET{$id} =~ /three_prime_UTR/){
+		    $feature = 'three_prime_UTR';
+		}elsif($SET{$id} =~ /five_prime_UTR/){
+                    $feature = 'five_prime_UTR';
+		}elsif($SET{$id} =~ /exon/){
+		    $feature = 'exon';
+		}else{
+		    $variant = 'intron_variant';
+		}
+		push(@adding, join(' ', $variant, $index, $feature, $feature_id));
+	    }
+	    if($info =~ /Variant_effect/){
+		my $add = 'Variant_effect='.join(',', @adding).',';
+		$line =~ s/Variant_effect=/$add/;
+		print $out $line."\n";
+	    }else{
+		my $add = 'Variant_effect='.join(',', @adding).';';
+		print $out $line.$add."\n";
+	    }
+	}else{
+	    print $out $line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub pull_rest{
+    my ($dir, $filter) = @_;
+    my $file = $dir.$filter.'.gff3';
+    foreach my $id (keys %GENES){
+	my $subset = `grep $id $file | grep -v gene | grep -v transcript | grep -v mRNA `;
+	print STDERR "\tAdding featurs for $id\n";
+	my @lines = split(/\n/, $subset);
+	my @locations = @{$GENES{$id}};
+	foreach(@locations){
+	    my $loc = $_;
+	    foreach(@lines){
+		my ($chr, $source, $type, $start, $stop, $five, $strand, $seven, $info) = split(/\t/, $_);
+		if($loc >= $start && $loc <= $stop){
+		    $RESULTS{$loc}{$id} .= ':'.$type;
+		}
+		next unless $type eq 'exon';
+		if(abs($loc - $start) <= 8 || abs($loc - $stop) <= 8){
+		    if(abs($loc - $start) <= 8 && $strand eq '+'){
+			if($loc >= $start){
+			    $RESULTS{$loc}{$id} .= ':splice_region_variant';
+			}else{
+			    $RESULTS{$loc}{$id}.= ':splice_region_variant' if abs($loc - $start) <= 3;
+			}
+		    }else{
+			if($loc <= $start){
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant';
+                        }else{
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant' if abs($loc - $start) <= 3;
+                        }
+		    }
+		    if(abs($loc - $stop) <= 8 && $strand eq '+'){
+                        if($loc <= $stop){
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant';
+                        }else{
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant' if abs($loc - $start) <= 3;
+                        }
+		    }else{
+			if($loc >= $stop){
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant';
+                        }else{
+                            $RESULTS{$loc}{$id}.= ':splice_region_variant' if abs($loc - $start) <= 3;
+                        }
+                    }
+		}
+	    }
+	}
+    }
+}
+##-----------------------------------------------##
+sub check_coordinates{
+    my ($start, $stop) = @_;
+    my $skip = 'yes';
+    my @keep;
+    foreach my $pos (sort {$a<=>$b} keys %GVF){
+	next unless $pos >= $start;
+	next unless $pos <= $stop;
+	$skip = 'no';
+	push(@keep, $pos);
+    }
+    return ($skip, @keep);
+}
+##-----------------------------------------------##
+sub get_genes{
+    my $dir = shift;
+    my $filter = shift;
+    my $max = shift;
+    my $min = shift;
+    my $file = $dir.$filter.'.gff3';
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    print STDERR "Getting genes for $filter\n";
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($chr, $source, $type, $start, $stop, $qual, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $type eq 'gene';
+	#next unless $start >= $min;
+	#last unless $start <= $max;
+	my ($skip, @keep) = check_coordinates($start, $stop);
+	next unless $skip eq 'no';
+	my $id = $info;
+	$id =~ s/ID=//;
+	$id =~ s/;//;
+	foreach(@keep){
+	    push(@{$GENES{$id}}, $_);
+	    $RESULTS{$_}{$id} = 'gene';
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_locations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    my $max = 0;
+    my $min = 1000000000000;
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	next if $line =~ /\#/;
+	next if length($line) == 0;
+	my ($chr, $source, $type, $start, $stop, $quality, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $filter eq $chr;
+	$GVF{$start} .= $type.';';
+	$max = $start unless $max > $start;
+	$min = $start unless $min < $start;
+    }
+    return ($max, $min);;
+}
+##-----------------------------------------------##
+sub get_files{
+    my $dir = shift;
+    opendir(DIR, $dir);
+    my @files = readdir(DIR);
+    my @gvf;
+    foreach(@files){
+	push(@gvf, $dir.$_) if $_ =~ /$opt_a/;
+    }
+    return @gvf;
+}
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_d && $opt_a && $opt_b;
+    return 1;
+}

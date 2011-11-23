@@ -1,0 +1,175 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use PostData;
+use Math::Round;
+use FileHandle;
+use MVS::Utils;
+use Getopt::Std;
+use vars qw($opt_i $opt_r $opt_t $opt_a $opt_b);
+use List::MoreUtils qw/uniq/;
+my $cmd = $0.' '.join(' ', @ARGV);
+getopts('i:t:r:a:b:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-i    <dbsnp.gvf directory>'."\n".
+    '-t    <generate | annotate>'."\n".
+    '-r    <PolyPhen report>'."\n".
+    '-a/-b <in.gvf/out.gvf>'."\n".
+
+    ''."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chr1 chr2 chr3 chr4 chr5 chr6 chr7
+	       chr8 chr9 chr10 chr11 chr12 chr13
+	       chr14 chr15 chr16 chr17 chr18 chr19
+	       chr20 chr21 chr22 chrX chrY chrMT);
+my %GVF;
+
+##---------------------Body----------------------##
+my @FILES = get_files($opt_i);
+my $OUT = get_outfile() if $opt_t eq 'generate';
+foreach(@CHROM){
+    my $chr = $_;
+    if($opt_t eq 'generate'){
+	print STDERR "Getting variants for $chr \n";
+	foreach(@FILES){
+	    get_locations($_, $chr);
+	}
+    }elsif($opt_t eq 'annotate'){
+	get_annotations($opt_r, $chr) if $opt_t eq 'annotate';
+	foreach(@FILES){
+            get_locations($_, $chr);
+        }
+    }
+    %GVF = ();
+}
+
+
+##------------------PostData---------------------##
+
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub add_pragmas{
+    my $line = shift;
+    my $file = shift;
+    return $line unless $line =~ /attribute-method/;
+    my $add = $cmd;
+    $add =~ s/$opt_i/$file/;
+    $line .= 'Annotation_PolyPhen='.$add.';';
+    return $line;
+}
+##-----------------------------------------------##
+sub get_annotations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($id, $snp_id, $acc, $pos, $aa1, $aa2, $prediction, $pph2_prob, $pph2_FPR, $pph2_TRP) = split(/\t/, $line);
+	my ($chrstart, $var, $gene, $extra) = split(/\./, $id);
+	$gene = $gene.'.'.$extra if defined($gene && $extra);
+	my ($chr, $start) = split(/\:/, $chrstart);
+	next unless $filter eq $chr;
+	$prediction =~ s/\s//g;
+	$prediction =~ s/possiblydamaging/possibly_damaging/;
+	$pph2_prob =~ s/\s//g;
+	push(@{$GVF{$chr.':'.$start.'.'.$var}}, join(' ', $prediction, $pph2_prob, $gene));
+    }
+}
+##-----------------------------------------------##
+sub get_outfile{
+    my $file = 'polyphen_temp.txt';
+    my $fh = new FileHandle;
+    $fh -> open(">> $file");
+    return $fh;
+}
+##-----------------------------------------------##
+sub get_locations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    my $outfile = $file;
+    $outfile =~ s/$opt_a/$opt_b/;
+    my $out = new FileHandle;
+    $out -> open(">> $outfile");
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	next if $line =~ /\#/ && $opt_t eq 'generate';
+	if($line =~ /\#/){
+	    next unless $filter eq 'chr1';
+	    $line = add_pragmas($line, $file);
+	    print $out $line."\n";
+	    next;
+	}
+	next if length($line) == 0;
+	my ($chr, $source, $type, $start, $stop, $quality, $strand, $seven, $info) = split(/\t/, $line);
+	next unless $filter eq $chr;
+	$chr =~ s/chr//;
+	next unless $type eq 'SNV';
+	my ($ref, $var, $prediction);
+	my @split = split(/\;/, $info);
+	foreach(@split){
+	    $ref = $_ if $_ =~ /Reference_seq/;
+	    $var = $_ if $_ =~ /Variant_seq/;
+	    $prediction = $_ if $_ =~ /Variant_prediction/;
+	}
+	$ref =~ s/Reference_seq=//;
+	$var =~ s/Variant_seq=//;
+	$var =~ s/$ref,// if $info =~ /heterozygous/;
+	my $id = join(' ', 'chr'.$chr.':'.$start, $ref.'/'.$var);
+	print $OUT $id."\n" if $opt_t eq 'generate';
+	next if $opt_t eq 'generate';
+	$id = 'chr'.$chr.':'.$start.'.'.$ref.$var;
+	if(defined($GVF{$id})){
+	    my @annotations = @{$GVF{$id}};
+	    my @keep;
+	    foreach(@annotations){
+		push(@keep, $_) if length($_) > 0;
+	    }
+	    my $annotation = join(' ', join(',PolyPhen:', uniq(@keep)));
+	    if(defined($prediction)){
+		$annotation = $prediction.',PolyPhen:'.$annotation;
+		$line =~ s/$prediction/$annotation/;
+		print $out $line."\n";
+	    }else{
+		$annotation = 'Variant_prediction='.'PolyPhen:'.$annotation.';';
+		print $out $line.$annotation."\n";
+	    }
+	}else{
+	    print $out $line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_files{
+    my $dir = shift;
+    opendir(DIR, $dir);
+    my @files = readdir(DIR);
+    my @gvf;
+    foreach(@files){
+	push(@gvf, $dir.$_) if $_ =~ /$opt_a/;
+    }
+    return @gvf;
+}
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_t && $opt_a && $opt_b;
+    return 1;
+}

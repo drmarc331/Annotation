@@ -1,0 +1,395 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use Math::Round;
+use PostData;
+use FileHandle;
+use MVS::Utils;
+use Getopt::Std;
+use List::MoreUtils qw/uniq/;
+use vars qw($opt_i $opt_d $opt_r $opt_a $opt_b);
+my $cmd = $0.' '.join(' ', @ARGV);
+getopts('i:d:r:a:b:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-i     <feature gvf directory>'."\n".
+    '-d     <gff3 directory>'."\n".
+    '-r     <fasta directory>'."\n".
+    '-a/-b <in.gvf/out.gvf>'."\n".
+    ''."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chrMT);
+my %MATRIX = MVS::Utils::load_mito_matrix();
+my %ONE_to_THREE = ('A' => 'Ala',
+		    'V' => 'Val',
+		    'L' => 'Leu',
+		    'I' => 'Ile',
+		    'P' => 'Pro',
+		    'W' => 'Trp',
+		    'F' => 'Phe',
+		    'M' => 'Met',
+		    'G' => 'Gly',
+		    'S' => 'Ser',
+		    'T' => 'Thr',
+		    'Y' => 'Tyr',
+		    'C' => 'Cys',
+		    'N' => 'Asn',
+		    'Q' => 'Gln',
+		    'K' => 'Lys',
+		    'R' => 'Arg',
+		    'H' => 'His',
+		    'D' => 'Asp',
+		    'E' => 'Glu',
+		    '*' => 'Stop');
+my %CDS;
+
+##---------------------Body----------------------##
+my @FILES = get_files($opt_i);
+foreach(@CHROM){
+    my $chr = $_;
+    print STDERR "Getting variants for $chr \n";
+    my $max = 0;
+    my $min = 1000000000000;
+    foreach(@FILES){
+	get_locations($_, $chr);
+    }
+    next unless (keys %CDS) > 0;
+    build_genes($opt_d, $chr, $opt_r);
+    foreach(@FILES){
+	add_annotations($_, $chr);
+    }
+    #PostData(\%CDS);
+    %CDS = ();
+}
+
+
+##------------------PostData---------------------##
+
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub add_pragmas{
+    my $line = shift;
+    my $file = shift;
+    return $line unless $line =~ /attribute-method/;
+    my $add = $cmd;
+    $add =~ s/$opt_i/$file/;
+    $line .= 'Annotation_Coding='.$add.';';
+    return $line;
+}
+##-----------------------------------------------##
+sub add_annotations{
+    my $infile = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    my $out = new FileHandle;
+    $fh -> open($infile);
+    my $outfile = $infile;
+    $outfile =~ s/$opt_a/$opt_b/;
+    $out -> open(">> $outfile");
+    while(defined(my $line = <$fh>)){
+        chomp $line;
+        if($line =~ /\#/){
+            next unless $filter eq 'chr1';
+            $line = add_pragmas($line, $infile);
+            print $out $line."\n";
+            next;
+        }
+        my ($chr, $source, $type, $start, $stop, $qual, $strand, $seven, $info) = split(/\t/, $line);
+        next unless $chr eq $filter;
+        my @split = split(/\;/, $info);
+        my $var;
+        my $ref;
+        my @new_info;
+        my $effect;
+        foreach(@split){
+            $effect = $_ if $_ =~ /Variant_effect/;
+            $var = $_ if $_ =~ /Variant_seq/;
+            $ref = $_ if $_ =~ /Reference_seq/;
+        }
+	$ref =~ s/Reference_seq=//;
+        $var =~ s/Variant_seq=//;
+        $var =~ s/$ref,// if $info =~ /heterozygous/;
+        die unless defined($start && $var);
+	if(defined($effect)){
+	    $effect =~ s/Variant_effect=//;
+	    my @splita = split(/\,/, $effect);
+	    my @effects;
+            foreach(@splita){
+		my ($a, $b, $c, $d) = split(/\s/, $_);
+                if(defined($CDS{$d}{$start}{$var})){
+		    $a = $CDS{$d}{$start}{$var}{variant};
+		    $b = $b;
+		    $c = $CDS{$d}{$start}{$var}{location};
+		    if(defined $CDS{$d}{$start}{$var}{annotation}){
+			$d = $d.'|'.$CDS{$d}{$start}{$var}{annotation} if defined $CDS{$d}{$start}{$var}{annotation};
+			$d =~ s/X/$var/;
+			$d =~ s/Y/$ref/;
+		    }
+		}
+		push(@effects, join(' ', $a, $b, $c, $d));
+	    }
+	    my $new_effect = join(',', @effects);
+	    $line =~ s/$effect/$new_effect/;
+	    print $out $line."\n";
+	}else{
+	    print $out $line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_coordinates{
+    my $file = shift;
+    my $ucsc = shift;
+    my %hash;
+    my $subset = `grep "$ucsc" $file | grep CDS`;
+    my @lines = split(/\n/, $subset);
+    my $strand;
+    my $num = 0;
+    foreach(@lines){
+	my ($chr, $source, $type, $start, $stop, $five, $std, $seven, $info) = split(/\t/, $_);
+	$strand = $std;
+	$num++;
+	my @split = split(/\;/, $info);
+	my $id;
+	foreach(@split){
+	    $id = $_ if $_ =~ /ID=/;
+	}
+	next unless defined $id;
+	$id =~ s/ID=//;
+        $hash{$num}{start} = $start;
+        $hash{$num}{stop} = $stop;
+    }
+    return ($strand, %hash);
+}
+##-----------------------------------------------##
+sub build_genes{
+    my ($gffdir, $filter, $fastadir) = @_;
+    my $gff_file = $gffdir.$filter.'.gff3';
+    my $fasta_file = $fastadir.$filter.'.fa';
+    print STDERR "Getting fasta for $filter\n";
+    my %fasta = MVS::Utils::parse_fasta($fasta_file);
+    foreach my $ucsc (keys %CDS){
+	next if $ucsc =~ /\|/;
+	if($ucsc =~ /ND2/){
+	    $MATRIX{ATT} = 'M';
+	}else{
+	    $MATRIX{ATT} = 'I';
+	}
+	my ($strand, %coords) = get_coordinates($gff_file, $ucsc);
+	next unless (keys %coords) > 0;
+	my $refseq;
+	foreach(my $i = 1; $i <= (keys %coords); $i++){
+	    my ($start, $stop) = ($coords{$i}{start}, $coords{$i}{stop});
+	    my $frag = substr($fasta{$filter}, $start-1, abs($start - $stop) + 1);
+	    $refseq .= $frag unless $strand eq '-';
+	    $refseq .= MVS::Utils::revComp($frag) if $strand eq '-';
+	}
+	my %LOCS = %{$CDS{$ucsc}};
+	my $key_count = (keys %LOCS);
+	foreach my $location (keys %LOCS){
+	    my %VARS = %{$CDS{$ucsc}{$location}};
+	    foreach my $var (keys %VARS){
+		my $ref = $CDS{$ucsc}{$location}{$var}{ref};
+		my $var_type = $CDS{$ucsc}{$location}{$var}{variant};
+		my $var_loc = $CDS{$ucsc}{$location}{$var}{location};
+		next unless $var_loc eq 'CDS';
+		print STDERR "\tBuilding annotations for $ucsc on $key_count variants\n";
+		$key_count--;
+		my ($sequence, $mask) = alter_sequence($fasta{$filter}, $ref, $var, $location);
+		my $altseq;
+		foreach(my $i = 1; $i <= (keys %coords); $i++){
+		    my ($start, $stop) = ($coords{$i}{start}, $coords{$i}{stop});
+		    my $frag = substr($sequence, $start-1, abs($start - $stop) + 1);
+		    $altseq .= $frag unless $strand eq '-';
+		    $altseq .= MVS::Utils::revComp($frag) if $strand eq '-';
+		}
+		$altseq =~ s/$mask/$var/ unless $strand eq '-';
+		my $rev_var = MVS::Utils::revComp($var);
+		$altseq =~ s/$mask/$rev_var/ if $strand eq '-';
+		$altseq =~ s/-//g;
+		my $annotation = compare_sequences($refseq, $altseq);
+		my ($x, $y, $z) = split(/\:/, $annotation);
+		if($var_type eq 'splice_region_variant'){
+		    $CDS{$ucsc}{$location}{$var}{location} = 'splice_region';
+		}
+		$CDS{$ucsc}{$location}{$var}{variant} = $x;
+		$CDS{$ucsc}{$location}{$var}{annotation} = $y.'|'.$z;
+	    }
+	}
+    }
+}
+##-----------------------------------------------##
+sub alter_sequence{
+    my ($seq, $ref, $var, $start) = @_;
+    if($ref =~ /-/){
+	$ref = substr($seq, $start, 1);
+	$var .= substr($seq, $start, 1);
+    }
+    my $mask = 'X' x length($ref);
+    substr($seq, $start-1, length($ref)) = $mask;
+    return ($seq, $mask);
+}
+##-----------------------------------------------##
+sub compare_sequences{
+    my ($refseq , $altseq) = @_;
+    my @ref = split(//, $refseq);
+    my @alt = split(//, $altseq);
+    my $coding_pos = 0;
+    my $annotation = 'sequence_variant';
+    my $frame = 'inframe';
+    $frame = 'non_mod3' unless (abs(@ref - @alt) / 3) == int(abs(@ref - @alt)/3);
+    $frame = 'mod3' if abs(@ref - @alt) > 0 && $frame ne 'non_mod3';
+    my $coding_num = 0;
+    foreach(my $i = 0; $i < @ref; $i += 3){
+	next unless defined ($ref[$i] && $ref[$i+1] && $ref[$i+2]);
+	next unless defined ($alt[$i] && $alt[$i+1] && $alt[$i+2]);
+	my $codon_num = ($i/3) + 1;
+	$coding_num++ if $ref[$i] eq $alt[$i];
+	$coding_num++ if $ref[$i+1] eq $alt[$i+1];
+	$coding_num++ if $ref[$i+2] eq $alt[$i+2];
+	my $codona = $ref[$i].$ref[$i+1].$ref[$i+2];
+	my $codonb = $alt[$i].$alt[$i+1].$alt[$i+2];
+	if($codona ne $codonb){
+	    if($frame eq 'inframe' && @ref == @alt){
+		my ($aa, $ab) = ($MATRIX{$codona}, $MATRIX{$codonb});
+		if($aa eq $ab){
+		    $annotation = 'synonomous_codon';
+		    $annotation .= ':c.'.$coding_num.'Y>X';
+		    $annotation .= ':p.'.$ONE_to_THREE{$aa}.$codon_num.$ONE_to_THREE{$ab};
+		    return $annotation;
+		}else{
+		    $annotation = 'non_synonomous_codon';
+		    $annotation .= ':c.'.$coding_num.'Y>X';
+		    $annotation .= ':p.'.$ONE_to_THREE{$aa}.$codon_num.$ONE_to_THREE{$ab};
+		    return $annotation;
+		}
+	    }elsif($frame eq 'mod3'){
+		if(@ref > @alt){
+		    $annotation = 'inframe_codon_loss';
+		    $annotation .= ':c.'.($coding_num-1).'_'.($coding_num + abs(@ref - @alt)).'delX';
+		    $annotation .= ':p.';
+		    foreach(my $j = 0; $j < (abs(@ref - @alt)/3); $j++){
+			my $this_codon = $ref[$i+$j].$ref[$i+$j+1].$ref[$i+$j+2];
+			$annotation .= $ONE_to_THREE{$this_codon};
+		    }
+		    $annotation .= 'del';
+		    return $annotation;
+		}else{
+		    $annotation = 'inframe_codon_gain';
+		    $annotation .= ':c.'.($coding_num-1).'_'.($coding_num).'insX';
+		    $annotation .= ':p.';
+		    my $precodon = $ref[$i-3].$ref[$i-2].$ref[$i-1];
+		    $annotation .= $ONE_to_THREE{$MATRIX{$precodon}}.($codon_num -1);
+		    $annotation .= '_'.$ONE_to_THREE{$MATRIX{$codona}}.'ins';
+                    foreach(my $j = 0; $j < (abs(@ref -@alt)/3); $j++){
+			my $this_codon = $alt[$i+$j].$alt[$i+$j+1].$alt[$i+$j+2];
+			$annotation .= $ONE_to_THREE{$this_codon};
+                    }
+		    return $annotation;
+		}
+	    }else{
+		if(@ref > @alt){
+		    $annotation = 'frameshift_variant';
+                    $annotation .= ':c.'.($coding_num-1).'_'.($coding_num + abs(@ref - @alt)).'delX';
+		    $annotation .= ':p.';
+		    if($MATRIX{$codona} eq $MATRIX{$codonb}){
+			my $a = $ref[$i+1].$ref[$i+2].$ref[$i+3];
+			my $b = $alt[$i+1].$alt[$i+2].$alt[$i+3];
+			$annotation .= $ONE_to_THREE{$MATRIX{$a}}.($codon_num+1).$ONE_to_THREE{$MATRIX{$b}};
+		    }else{
+			$annotation .= $ONE_to_THREE{$MATRIX{$codona}}.($codon_num).$ONE_to_THREE{$MATRIX{$codonb}};
+		    }
+		    $annotation .= 'fs';
+		    return $annotation;
+		}else{
+		    $annotation = 'frameshift_variant';
+                    $annotation .= ':c.'.($coding_num-1).'_'.($coding_num).'insX';
+		    $annotation .= ':p.';
+                    if($MATRIX{$codona}eq $MATRIX{$codonb}){
+			my $a = $ref[$i+1].$ref[$i+2].$ref[$i+3];
+			my $b = $alt[$i+1].$alt[$i+2].$alt[$i+3];
+			$annotation .= $ONE_to_THREE{$MATRIX{$a}}.($codon_num+1).$ONE_to_THREE{$MATRIX{$b}};
+                    }else{
+			$annotation .= $ONE_to_THREE{$MATRIX{$codona}}.($codon_num).$ONE_to_THREE{$MATRIX{$codonb}};
+                    }
+                    $annotation .= 'fs';
+		    return $annotation;
+		}
+	    }
+	}else{
+	}
+    }
+    return $annotation;
+}
+##-----------------------------------------------##
+sub get_locations{
+    my $file = shift;
+    my $filter = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    my $max = 0;
+    my $min = 1000000000000;
+    while(defined(my $line = <$fh>)){
+        chomp $line;
+        next if $line =~ /\#/;
+        next if length($line) == 0;
+        my ($chr, $source, $type, $start, $stop, $quality, $strand, $seven, $info) = split(/\t/, $line);
+        next unless $filter eq $chr;
+	my ($ref, $var, $effect);
+        my @split = split(/\;/, $info);
+        foreach(@split){
+            $ref = $_ if $_ =~ /Reference_seq/;
+            $var = $_ if $_ =~ /Variant_seq/;
+            $effect = $_ if $_ =~ /Variant_effect/
+	    }
+        $ref =~ s/Reference_seq=//;
+        $var =~ s/Variant_seq=//;
+        $var =~ s/$ref,// if $var =~ /,/;
+        next unless defined($effect);
+        $effect =~ s/Variant_effect=//;
+	my @splita = split(/\,/, $effect);
+	foreach(@splita){
+	    my ($variant, $index, $location, $id) = split(/\s/, $_);
+
+	    ## variant = 3_prime_UTR_variant 5_prime_UTR_variant intron_variant sequence_variant splice_region_variant
+	    ## index = 0 1
+	    ## location = CDS exon five_prime_UTR intron three_prime_UTR
+	    ## id = gff3 id
+
+	    $CDS{$id}{$start}{$var}{ref} = $ref;
+	    $CDS{$id}{$start}{$var}{variant} = $variant;
+	    $CDS{$id}{$start}{$var}{location} = $location;
+        }
+    }	
+    return ($max, $min);
+}
+##-----------------------------------------------##
+sub get_files{
+    my $dir = shift;
+    opendir(DIR, $dir);
+    my @files = readdir(DIR);
+    my @gvf;
+    foreach(@files){
+	push(@gvf, $dir.$_) if $_ =~ /$opt_a/;
+    }
+    return @gvf;
+}
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_d && $opt_r && $opt_a && $opt_b;
+    return 1;
+}
