@@ -1,0 +1,259 @@
+#!/usr/bin/perl -w
+
+use strict;
+use lib '/home/msingleton/lib/';
+use PostData;
+use FileHandle;
+use Math::Round;
+use MVS::Utils;
+use Getopt::Std;
+use List::MoreUtils qw/uniq/;
+use vars qw($opt_s $opt_p $opt_i $opt_b $opt_o $opt_r);
+my $cmd = $0.' '.join(" ", @ARGV);
+getopts('s:i:b:o:r:p:');
+$| =1;
+
+
+my $usage = "\n\n".
+    'USAGE'."\n\n".
+    '-s     <infile.snv>'."\n".
+    '-i     <infile.indel>'."\n".
+    '-o     <outfile>'."\n".
+    '-r     <source>'."\n".
+    '-p     <pragma_file>'."\n".
+    '-b     <bed file optional>'."\n".
+    ''."\n".
+
+    "\n\n";
+
+die $usage unless args_ok();
+
+##-------------------Variables-------------------##
+my @CHROM = qw(chr1 chr2 chr3 chr4 chr5 chr6 chr7 
+	       chr8 chr9 chr10 chr11 chr12 chr13
+	       chr14 chr15 chr16 chr17 chr18 chr19
+	       chr20 chr21 chr22 chrX chrY chrM);
+my %DATA;
+my %BED;
+
+
+##---------------------Body----------------------##
+load_bed($opt_b) if $opt_b;
+my $out = new FileHandle;
+$out -> open("> $opt_o.gvf");
+load_pragmas($opt_p);
+foreach(@CHROM){
+    get_clc_snv($opt_s, $_);
+    get_clc_indel($opt_i, $_);
+    print_variants();
+    %DATA = ();
+}
+
+
+##------------------PostData---------------------##
+#PostData(\%DATA);
+
+##-----------------------------------------------##
+
+
+##---------------------SUBS----------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+##-----------------------------------------------##
+sub load_pragmas{
+    my $file = shift;
+    my $pragma = `cat $file`;
+    my $date = localtime;
+    my $method = 'VCF2GVF='.$cmd.';';
+    $pragma =~ s/DATE/$date/;
+    $pragma =~ s/INDIVIDUAL/$opt_r/;
+    $pragma .= $method;
+    print $out $pragma."\n\n";
+}
+##-----------------------------------------------##
+sub print_variants{
+    foreach my $chr (keys %DATA){
+	print STDERR "Printing gvf for $chr\n";
+	my %SET = %{$DATA{$chr}};
+	foreach my $pos (sort {$a<=>$b} keys %SET){
+	    my $id = 'ID='.$chr.':'.$DATA{$chr}{$pos}{start}.':'.$DATA{$chr}{$pos}{stop}.':'.$DATA{$chr}{$pos}{type};
+	    my $ref = 'Reference_seq='.$DATA{$chr}{$pos}{ref};
+	    my $var = 'Variant_seq='.$DATA{$chr}{$pos}{var};
+	    my $zyg = 'Genotype='.$DATA{$chr}{$pos}{zyg};
+	    my $tot_rds = 'Total_reads='.$DATA{$chr}{$pos}{tot_read};
+	    my $vdr_rds = 'Variant_reads='.$DATA{$chr}{$pos}{var_reads};
+	    my @info_array = ($id, $ref, $var, $zyg, $tot_rds, $vdr_rds);
+	    my @gvf_array = ($chr, $DATA{$chr}{$pos}{source},
+			     $DATA{$chr}{$pos}{type},
+			     $DATA{$chr}{$pos}{start},
+			     $DATA{$chr}{$pos}{stop},
+			     $DATA{$chr}{$pos}{qual},
+			     $DATA{$chr}{$pos}{strand},
+			     $DATA{$chr}{$pos}{seven},
+			          join(';', @info_array).';'
+			     );
+	    my $gvf_line = join("\t", @gvf_array);
+	    print $out $gvf_line."\n";
+	}
+    }
+}
+##-----------------------------------------------##
+sub get_clc_indel{
+    my $fh = new FileHandle;
+    $fh -> open(shift);
+    my $filter = shift;
+    my %bed;
+    if($opt_b){
+	return unless defined $BED{$filter};
+	%bed = %{$BED{$filter}};
+    }
+    print STDERR "\tGetting $filter InDels...\n";
+    while(defined(my $line = <$fh>)){
+        chomp $line;
+        my ($Mapping, $Reference_Position, $Consensus_Position, $Variation_Type, $Length, $Reference, $Variants, $Allele_Variations,
+            $Frequencies, $Counts, $Coverage, $Variant_1, $Frequency_1, $Count_1, $Variant_2, $Frequency_2, $Count_2,
+            $Overlapping_Annotation, $AminoAcidChange) = split (/\t/, $line);
+        $Mapping =~ s/ mapping//;
+        next unless $Mapping eq $filter;
+        my $skip = 'yes';
+        if($opt_r){
+	    foreach my $pos (sort keys %bed){
+		my ($from, $to) = split(/\:/, $pos);
+		$skip = 'no' if $from <= $Reference_Position && $to >= $Reference_Position;
+		last if $from <= $Reference_Position && $to>= $Reference_Position;
+	    }
+	}else{
+	    $skip = 'no';
+	}
+        next if $skip eq 'yes';
+        my $score;
+        my $var;
+        my $zyg;
+        my $var_rds = 0;
+	my $type = 'INDEL';
+	my $stop = $Reference_Position;
+        if($Variants > 1){
+            $score = nearest(0.01, ($Count_1 + $Count_2) / $Coverage);
+            $zyg = 'heterozygous';
+            my ($a, $b) = split(/\//, $Allele_Variations);
+            $var = $a.','.$b unless $b eq $Reference;
+            $var = $b.','.$a unless $a eq $Reference;
+            $var_rds = $Count_1 unless $a eq $Reference;
+            $var_rds = $Count_2 unless $b eq $Reference;
+	}else{
+            $score = nearest(0.01, ($Count_1) / $Coverage);
+            $zyg = 'homozygous';
+            $var = $Allele_Variations;
+	    $var_rds = $Count_1;
+        }
+	if($Reference =~ /\-/){
+	    $type = 'NUCLEOTIDE_INSERTION';
+	    if($Variants > 1){
+		my ($a, $b) = split(/\,/, $var);
+		$var = $Reference.','.$b;
+		$stop += (length($var) - 1);
+	    }else{
+	    }
+	}else{
+	    $type = 'NUCLEOTIDE_DELETION';
+	    if($Variants > 1){
+                my ($a, $b) = split(/\,/, $var);
+		$var = $Reference.','.$b;
+		$stop += (length($Reference) - 1);
+	    }else{
+	    }
+	}
+	$stop = $Reference_Position + length($Reference) - 1;
+	$DATA{$Mapping}{$Reference_Position}{ref} = $Reference;
+	$DATA{$Mapping}{$Reference_Position}{source} = $opt_r;
+	$DATA{$Mapping}{$Reference_Position}{type} = $type;
+	$DATA{$Mapping}{$Reference_Position}{start} = $Reference_Position;
+	$DATA{$Mapping}{$Reference_Position}{stop} = $Reference_Position;
+	$DATA{$Mapping}{$Reference_Position}{var} = $var;
+	$DATA{$Mapping}{$Reference_Position}{qual} = $score;
+	$DATA{$Mapping}{$Reference_Position}{strand} = '+';
+	$DATA{$Mapping}{$Reference_Position}{seven} = '.';
+	$DATA{$Mapping}{$Reference_Position}{zyg} = $zyg;
+	$DATA{$Mapping}{$Reference_Position}{tot_read} = $Coverage;
+	$DATA{$Mapping}{$Reference_Position}{var_reads} = $var_rds;
+    }
+}
+##-----------------------------------------------##
+sub get_clc_snv{
+    my $fh = new FileHandle;
+    $fh -> open(shift);
+    my $filter = shift;
+    my %bed;
+    if($opt_b){
+	return unless defined $BED{$filter};
+	%bed = %{$BED{$filter}};
+    }
+    print STDERR "\tGetting $filter SNV...\n";
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($Mapping, $Reference_Position, $Consensus_Position, $Variation_Type, $Length, $Reference, $Variants, $Allele_Variations,
+	    $Frequencies, $Counts, $Coverage, $Variant_1, $Frequency_1, $Count_1, $Variant_2, $Frequency_2, $Count_2, 
+	    $Overlapping_Annotation, $AminoAcidChange) = split (/\t/, $line);
+	$Mapping =~ s/ mapping//;
+	next unless $Mapping eq $filter;
+	my $skip = 'yes';
+	if($opt_r){
+	    foreach my $pos (sort keys %bed){
+		my ($from, $to) = split(/\:/, $pos);
+		$skip = 'no' if $from <= $Reference_Position && $to >= $Reference_Position;
+		last if $from <= $Reference_Position && $to>= $Reference_Position;
+	    }
+	}else{
+	    $skip = 'no';
+	}
+	next if $skip eq 'yes';
+	my $score;
+	my $var;
+	my $zyg;
+	my $var_rds;
+	if($Variants > 1){
+	    $score = nearest(0.01, ($Count_1 + $Count_2) / $Coverage);
+	    $zyg = 'heterozygous';
+	    my ($a, $b) = split(/\//, $Allele_Variations);
+	    $var = $a.','.$b unless $b eq $Reference;
+	    $var = $b.','.$a unless $a eq $Reference;
+	    $var_rds = $Count_1 unless $a eq $Reference;
+	    $var_rds = $Count_2 unless $b eq $Reference;
+	}else{
+	    $score = nearest(0.01, ($Count_1) / $Coverage);
+	    $zyg = 'homozygous';
+	    $var = $Allele_Variations;
+	    $var_rds = $Count_1;
+	}
+	$DATA{$Mapping}{$Reference_Position}{ref} = $Reference;
+	$DATA{$Mapping}{$Reference_Position}{source} = $opt_r;
+	$DATA{$Mapping}{$Reference_Position}{type} = 'SNV';
+	$DATA{$Mapping}{$Reference_Position}{start} = $Reference_Position;
+	$DATA{$Mapping}{$Reference_Position}{stop} = $Reference_Position;
+	$DATA{$Mapping}{$Reference_Position}{var} = $var;
+	$DATA{$Mapping}{$Reference_Position}{qual} = $score;
+	$DATA{$Mapping}{$Reference_Position}{strand} = '+';
+	$DATA{$Mapping}{$Reference_Position}{seven} = '.';
+	$DATA{$Mapping}{$Reference_Position}{zyg} = $zyg;
+	$DATA{$Mapping}{$Reference_Position}{tot_read} = $Coverage;
+	$DATA{$Mapping}{$Reference_Position}{var_reads} = $var_rds;
+    }
+}
+##-----------------------------------------------##
+sub load_bed{
+    print STDERR "Loading BED file...\n";
+    my $file = shift;
+    my $fh = new FileHandle;
+    $fh -> open($file);
+    while(defined(my $line = <$fh>)){
+	chomp $line;
+	my ($chr, $start, $stop, $gene) = split(/\t/, $line);
+	next unless defined($chr && $start && $stop);
+	$BED{$chr}{$start.':'.$stop} = $gene;
+    }
+}
+##-----------------------------------------------##
+sub args_ok {
+    return 0 unless $opt_i && $opt_o && $opt_r && $opt_s && $opt_p;
+    return 1;
+}
